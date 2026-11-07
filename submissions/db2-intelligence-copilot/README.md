@@ -65,7 +65,7 @@ verified against a real Db2 database from what is so far tested only with fakes.
 |---|---|
 | Migrations 001–003 (metadata schema, demo data, 11 explain tables) | **Verified on Db2** (TESTDB, Db2 12.1.5) |
 | Static SQL guard (`lint`) | Offline by design; decisions matched the Db2 probe |
-| Prepare-only analysis: package-cache cost, `EXPLAIN_FROM_SECTION`, plan object checks, rollback and leftover verification | **Verified on Db2** (controlled probe, see [Testing](#testing--verification)) |
+| Prepare-only analysis: package-cache cost, `EXPLAIN_FROM_SECTION` bounded by a read-back statement timeout, plan object checks, rollback and leftover verification | **Verified on Db2** (supervised integration test IT3, G2.4; see [Testing](#testing--verification)) |
 | Statement-level query timeout read-back | **Verified on Db2** |
 | HTTP API (`/health`, `/guard/status`, `/guard/lint`, `/guard/check`, `/ask`) | Tested offline only (FastAPI test client) |
 | Guard worker subprocess (deadline, SIGKILL, bounded pool, degraded latch, allow-listed environment, redacted stderr log, explain-tables-empty startup check) | Tested offline with real subprocesses and fake backends; **not yet run against Db2** |
