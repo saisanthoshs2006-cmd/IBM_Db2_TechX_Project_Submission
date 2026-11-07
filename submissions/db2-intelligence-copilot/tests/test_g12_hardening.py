@@ -9,6 +9,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -446,24 +447,30 @@ def test_db2_marker_is_registered_and_markers_are_strict():
     assert "--strict-markers" in cfg["addopts"]
 
 
+INTEGRATION_TESTS = 3  # test_placeholder, test_it1, test_it2 (G2.0)
+
+
 def _run_pytest(args, cwd, extra_env=None):
     env = {k: v for k, v in os.environ.items() if k != "DB2INTEL_IT"}
     env.update(extra_env or {})
-    return subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-rs", *args],
-                          cwd=cwd, env=env, capture_output=True, text=True, timeout=120)
+    with tempfile.TemporaryDirectory() as blocker:  # the real driver cannot load in the subprocess
+        Path(blocker, "ibm_db.py").write_text("raise ImportError('ibm_db is blocked in this offline test')\n")
+        env["PYTHONPATH"] = os.pathsep.join([blocker, str(PROJECT_ROOT / "src"), str(PROJECT_ROOT / "tests")])
+        return subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-rs", *args],
+                              cwd=cwd, env=env, capture_output=True, text=True, timeout=120)
 
 
 @pytest.mark.parametrize("it,reason", [(None, "set DB2INTEL_IT=1"), ("1", "gate G2"), ("0", "set DB2INTEL_IT=1")])
 def test_integration_skeleton_always_skips(it, reason):
     r = _run_pytest(["tests/integration"], PROJECT_ROOT, {"DB2INTEL_IT": it} if it else None)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "1 skipped" in r.stdout and "passed" not in r.stdout and reason in r.stdout
+    assert f"{INTEGRATION_TESTS} skipped" in r.stdout and "passed" not in r.stdout and reason in r.stdout
 
 
 def test_integration_conftest_leaves_unit_tests_alone():
     r = _run_pytest(["tests/integration", "tests/test_config.py"], PROJECT_ROOT)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "1 skipped" in r.stdout and " passed" in r.stdout
+    assert f"{INTEGRATION_TESTS} skipped" in r.stdout and " passed" in r.stdout
 
 
 def test_unmarked_test_under_integration_is_rejected(tmp_path):
