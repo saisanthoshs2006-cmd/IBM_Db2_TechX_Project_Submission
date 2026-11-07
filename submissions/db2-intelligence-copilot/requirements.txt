@@ -1,0 +1,14 @@
+ibm_db==3.3.0
+# HTTP API (Phase 2C). Transitive dependencies pinned to the versions resolved on 2026-11-07.
+fastapi==0.115.12
+starlette==0.46.2
+pydantic==2.11.4
+pydantic-core==2.33.2
+annotated-types==0.8.0
+typing-extensions==4.16.0
+typing-inspection==0.4.5
+anyio==4.16.0
+idna==3.20
+uvicorn==0.34.2
+click==8.5.1
+h11==0.16.0

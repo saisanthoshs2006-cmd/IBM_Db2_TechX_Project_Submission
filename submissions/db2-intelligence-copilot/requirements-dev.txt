@@ -1,0 +1,5 @@
+pytest==9.2.0
+# fastapi.testclient (tests only)
+httpx==0.28.1
+httpcore==1.0.9
+certifi==2026.10.23

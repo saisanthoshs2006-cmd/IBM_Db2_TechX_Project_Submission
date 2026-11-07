@@ -1,0 +1,14 @@
+[project]
+name = "db2-intelligence-copilot"
+version = "0.1.0"
+description = "Db2 Intelligence: Enterprise AI Data Copilot for IBM Db2"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "db2: needs a real Db2 database; skipped unless DB2INTEL_IT=1 (tests/integration only)",
+]

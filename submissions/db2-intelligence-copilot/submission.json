@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "project": {
+    "title": "Db2 Intelligence — Enterprise AI Data Copilot",
+    "slug": "db2-intelligence-copilot",
+    "short_description": "Natural-language questions to IBM Db2 SQL, checked before anything runs by a Db2-aware SQL guard: allow-list static analysis, prepare-only cost estimation from the package cache and EXPLAIN_FROM_SECTION plan inspection with verified rollback. Generated SQL is never executed automatically.",
+    "category": "AI / Text-to-SQL / Data Governance",
+    "demo_url": "",
+    "video_url": "",
+    "repo_url": ""
+  },
+  "team": {
+    "name": "Team Name Here",
+    "members": [
+      {
+        "name": "Full Name",
+        "github": "saisanthoshs2006-cmd",
+        "email": "user@example.com",
+        "role": "Backend, Db2 integration, SQL guard and AI workflow"
+      }
+    ]
+  },
+  "ibm_db2": {
+    "edition": "Db2 Community Edition 12.1.5 (Docker)",
+    "connector": "ibm_db 3.3.0 (Python, bundled Db2 CLI driver)",
+    "features_used": [
+      "Relational tables, primary/foreign keys, check constraints, indexes and a view",
+      "Catalog remarks (COMMENT ON) and SYSCAT catalog views",
+      "Prepare-only analysis with MON_GET_PKG_CACHE_STMT (QUERY_COST_ESTIMATE)",
+      "SYSPROC.EXPLAIN_FROM_SECTION with the Db2 explain tables",
+      "Native VECTOR(768, FLOAT32) columns (VECTOR_DISTANCE search planned)"
+    ]
+  },
+  "tech_stack": {
+    "languages": ["Python", "SQL"],
+    "frameworks": ["FastAPI", "Pydantic", "Uvicorn", "pytest"],
+    "ai_models": ["Ollama local chat model (configurable, default qwen2.5-coder:7b)", "Ollama nomic-embed-text (768-dimensional embeddings)"]
+  }
+}
