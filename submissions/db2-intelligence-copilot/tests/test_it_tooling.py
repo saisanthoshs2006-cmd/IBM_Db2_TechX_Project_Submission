@@ -123,7 +123,30 @@ def test_listing_names_every_statement():
     marked(),
 ])
 def test_marked_pk_lookup_pattern_accepts_the_guard_marker(sql):
-    assert Q.MARKED_PK_LOOKUP_RE.match(sql)
+    assert Q.MARKED_PK_LOOKUP_RE.match(sql) and Q.is_allowed_marked(sql)
+
+
+def test_it3_bodies_are_the_guard_canonical_texts_and_are_allowed_when_marked():
+    from db2intel.guard.parser import guard_sql
+    assert set(Q.IT3_GUARDED) == {"pk lookup", "regional report", "view (expanded)", "runaway cross join"}
+    for label, sql, status in Q.IT3_QUERIES:
+        if status == A.BLOCKED:
+            assert label not in Q.IT3_GUARDED
+            continue
+        text = guard_sql(sql, Q.IT3_ALLOWED_SCHEMAS, Q.IT3_MAX_ROWS).text
+        assert Q.IT3_GUARDED[label] == text and text.endswith("FETCH FIRST 500 ROWS ONLY")
+        assert Q.is_allowed_marked(marked(text)) and not Q.is_allowed_marked(text)
+        assert not Q.is_allowed_marked(marked(text) + " ") and not Q.is_allowed_marked(marked(text.lower()))
+
+
+def test_protected_table_query_is_blocked_statically_and_never_allowed_marked():
+    assert not Q.is_allowed_marked(marked("SELECT * FROM DB2INST1.EMPLOYEE_INFO FETCH FIRST 500 ROWS ONLY"))
+    assert not any("DB2INST1" in body for body in Q.MARKED_BODIES)
+
+
+@pytest.mark.parametrize("sql", [None, 5, b"x", "/* DB2INTEL_REQ_" + "A" * 32 + " */ "])
+def test_is_allowed_marked_rejects_non_statements(sql):
+    assert not Q.is_allowed_marked(sql)
 
 
 @pytest.mark.parametrize("sql", [
@@ -185,10 +208,31 @@ def test_prepare_of_an_allowed_select_adds_and_verifies_the_timeout():
     assert drv.log == [("prepare", Q.AUDIT_COUNT_SQL)]
 
 
-def test_prepare_keeps_caller_options_and_overrides_any_caller_timeout():
+def test_prepare_keeps_caller_options_and_adds_the_run_timeout():
     drv, fake, conn = guarded()
-    stmt = drv.prepare(conn, marked(), {fake.SQL_ATTR_DEFERRED_PREPARE: 0, fake.SQL_ATTR_QUERY_TIMEOUT: 999})
+    stmt = drv.prepare(conn, marked(), {fake.SQL_ATTR_DEFERRED_PREPARE: 0})
     assert stmt.options == {fake.SQL_ATTR_DEFERRED_PREPARE: 0, fake.SQL_ATTR_QUERY_TIMEOUT: T}
+
+
+def test_prepare_keeps_and_verifies_a_valid_caller_timeout():
+    """The production guard sets its own EXPLAIN timeout; the driver must not mask it."""
+    drv, fake, conn = guarded()
+    stmt = drv.prepare(conn, Q.CALL_EXPLAIN_SQL, {fake.SQL_ATTR_QUERY_TIMEOUT: 45})
+    assert stmt.options == {fake.SQL_ATTR_QUERY_TIMEOUT: 45}
+
+
+@pytest.mark.parametrize("timeout", [999, 0, 121, "30", True, 30.0, None])
+def test_prepare_refuses_an_invalid_caller_timeout(timeout):
+    drv, fake, conn = guarded()
+    with pytest.raises(D.DriverRefused):
+        drv.prepare(conn, Q.CALL_EXPLAIN_SQL, {fake.SQL_ATTR_QUERY_TIMEOUT: timeout})
+    assert real_calls(fake, "prepare") == []
+
+
+def test_caller_timeout_that_does_not_read_back_is_refused():
+    drv, fake, conn = guarded(call_read_back=30)
+    with pytest.raises(D.DriverRefused, match="reads back 30, expected 45"):
+        drv.prepare(conn, Q.CALL_EXPLAIN_SQL, {fake.SQL_ATTR_QUERY_TIMEOUT: 45})
 
 
 @pytest.mark.parametrize("read_back", [False, 0, 29, 31, True, "30"])
@@ -312,7 +356,7 @@ def explain_call(drv, fake, conn, inputs=None, types=None):
 
 def test_prepared_explain_call_runs_with_valid_inputs():
     drv, fake, conn = guarded()
-    fake.state.cache.append(["01" * 32, 1.0, 0, marked()])
+    fake.state.cache.append(["01" * 32, 1.0, 0, marked(), "NULLID", "SYSSH200", "", 1])
     stmt = explain_call(drv, fake, conn)
     assert drv.execute(stmt) is True and len(fake.state.pending) == 1
 
@@ -363,7 +407,7 @@ def test_bind_param_rules():
 
 def test_callproc_only_explain_from_section_with_the_approved_inputs():
     drv, fake, conn = guarded()
-    fake.state.cache.append(["01" * 32, 1.0, 0, marked()])
+    fake.state.cache.append(["01" * 32, 1.0, 0, marked(), "NULLID", "SYSSH200", "", 1])
     ok = (b"\x01" * 32, "M", None, -1, "DB2INTEL", "", "", "", "", "")
     for name, params in (("SYSPROC.ADMIN_CMD", ok), ("SYSPROC.EXPLAIN_FROM_SECTION", ok[:9]),
                          ("SYSPROC.EXPLAIN_FROM_SECTION", list(ok)),
@@ -730,7 +774,7 @@ def test_work_directory_must_be_new_and_empty(tmp_path):
 
 def test_unknown_step_is_refused(tmp_path):
     with pytest.raises(ValueError):
-        V.supervise("it3", None, None, tmp_path / "work")
+        V.supervise("it9", None, None, tmp_path / "work")
 
 
 def test_unwritable_report_is_never_pass(tmp_path, monkeypatch):
@@ -748,10 +792,26 @@ def test_unwritable_report_is_never_pass(tmp_path, monkeypatch):
     (["--step", "it1", "--workdir", str(PROJECT_ROOT)], "outside the project"),
     (["--step", "it1", "--workdir", "/tmp/x", "--query-timeout", "60", "--snapshot-deadline", "60"], "shorter"),
 ])
-def test_main_refuses_bad_arguments(argv, message, capsys):
+def test_main_refuses_bad_arguments(argv, message, capsys, monkeypatch):
+    monkeypatch.setattr(V, "supervise", lambda *a, **k: pytest.fail("a refused command line must not start a run"))
     with pytest.raises(SystemExit):
         V.main(argv)
     assert message in capsys.readouterr().err
+
+
+def test_main_refuses_an_interpreter_without_ibm_db_before_any_child(tmp_path, monkeypatch, capsys):
+    import importlib.util
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None if name == "ibm_db" else real(name, *a))
+    monkeypatch.setattr(V, "supervise", lambda *a, **k: pytest.fail("must not start without ibm_db"))
+    code = V.main(["--step", "snapshot", "--workdir", str(tmp_path / "w")])
+    assert code == 4 and "ibm_db is not installed" in capsys.readouterr().out
+    assert not (tmp_path / "w").exists()
+
+
+def test_report_records_the_interpreter(tmp_path):
+    _, report = run(tmp_path)
+    assert report["python"] == sys.executable
 
 
 def test_commands_for_a_real_run(tmp_path):
@@ -848,7 +908,7 @@ def test_integration_tests_skip_in_a_normal_run_even_with_it_enabled(tmp_path):
         out = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-rs", "tests/integration"],
                              capture_output=True, text=True, env={**env, **extra}, cwd=PROJECT_ROOT, timeout=120)
         assert out.returncode == 0, out.stdout + out.stderr
-        assert "3 skipped" in out.stdout and "passed" not in out.stdout
+        assert "4 skipped" in out.stdout and "passed" not in out.stdout
 
 
 # ==== IT1 / IT2 end to end against the fake ====================================================
@@ -968,3 +1028,103 @@ def test_it_tests_refuse_a_non_testdb_server(it_env):
     _, work = it_env("it1", server="SAMPLE")
     with pytest.raises(RuntimeError, match="expected TESTDB"):
         test_it1.test_it1_query_timeout_read_back()
+
+
+# ==== IT3: the production guard end to end against the fake ===================================
+def test_it3_end_to_end_runs_the_production_guard_with_the_bounded_call(it_env):
+    from integration import test_it3
+    fake, work = it_env("it3")
+    test_it3.test_it3_production_guard_analysis()
+    r = results(work, "it3")
+    assert r["outcome"] == "passed", r.get("error")
+    assert r["context"]["explain_timeout_seconds"] == 30 and r["context"]["session_user"] == "DB2INST1"
+    got = {d["label"]: (d["status"], d["code"], d["bounded_calls"]) for d in r["decisions"]}
+    assert got == {"pk lookup": ("APPROVED", "approved", 1), "regional report": ("APPROVED", "approved", 1),
+                   "view (expanded)": ("APPROVED", "approved", 1),
+                   "runaway cross join": ("COST_REJECTED", "cost_too_high", 0),
+                   "protected table": ("BLOCKED", got["protected table"][1], 0)}
+    assert set(r["leftover_counts"].values()) == {0} and fake.state.pending == []
+    assert not real_calls(fake, "callproc") and not real_calls(fake, "commit") and not real_calls(fake, "exec_immediate")
+    call_prepares = [c for c in real_calls(fake, "prepare") if c[1] == Q.CALL_EXPLAIN_SQL]
+    assert len(call_prepares) == 3 and all(c[2] == {fake.SQL_ATTR_QUERY_TIMEOUT: 30} for c in call_prepares)
+    executed = [c[1] for c in real_calls(fake, "execute")]
+    assert not any(Q.is_allowed_marked(s) for s in executed) and all(s in Q.EXECUTABLE_SQL for s in executed)
+
+
+def test_it3_uses_the_configured_timeout_from_app_setting(it_env):
+    from integration import test_it3
+    fake, work = it_env("it3", limit_timeout=45)
+    test_it3.test_it3_production_guard_analysis()
+    assert results(work, "it3")["context"]["explain_timeout_seconds"] == 45
+    call_prepares = [c for c in real_calls(fake, "prepare") if c[1] == Q.CALL_EXPLAIN_SQL]
+    assert call_prepares and all(c[2] == {fake.SQL_ATTR_QUERY_TIMEOUT: 45} for c in call_prepares)
+
+
+def test_it3_fails_when_the_call_timeout_does_not_read_back(it_env):
+    from integration import test_it3
+    fake, work = it_env("it3", call_read_back=0)
+    with pytest.raises(AssertionError):
+        test_it3.test_it3_production_guard_analysis()
+    r = results(work, "it3")
+    assert r["outcome"] == "failed" and set(r["leftover_counts"].values()) == {0}
+    assert all(d["status"] != "APPROVED" for d in r["decisions"])
+    assert not any(c[1] == Q.CALL_EXPLAIN_SQL for c in real_calls(fake, "execute"))
+
+
+def test_it3_detects_explain_rows_left_after_rollback(it_env):
+    from integration import test_it3
+    _, work = it_env("it3", rollback_keeps_rows=True)
+    with pytest.raises(AssertionError):
+        test_it3.test_it3_production_guard_analysis()
+    r = results(work, "it3")
+    assert r["outcome"] == "failed" and any(d["code"] == "cleanup_failed" for d in r["decisions"])
+
+
+def test_ibm_db_check_handles_a_module_loaded_without_a_spec(monkeypatch):
+    import importlib.util
+    import types
+
+    def no_spec(name, *a):
+        raise ValueError(f"{name}.__spec__ is None")
+    monkeypatch.setattr(importlib.util, "find_spec", no_spec)
+    monkeypatch.setitem(sys.modules, "ibm_db", types.ModuleType("ibm_db"))
+    assert V._ibm_db_installed() is True
+    monkeypatch.setitem(sys.modules, "ibm_db", None)
+    assert V._ibm_db_installed() is False
+
+
+def test_it3_fails_when_a_decision_differs_from_the_expected_status(it_env):
+    from integration import test_it3
+    _, work = it_env("it3", limit_cost="50000000")  # the runaway cross join now fits the limit
+    with pytest.raises(AssertionError):
+        test_it3.test_it3_production_guard_analysis()
+    r = results(work, "it3")
+    assert r["outcome"] == "failed"
+    assert {d["label"]: d["status"] for d in r["decisions"]}["runaway cross join"] == "APPROVED"
+
+
+def test_it3_fails_on_foreign_explain_rows_the_guard_cannot_see(it_env):
+    """Rows outside every request's key survive each analysis's own checks; the final whole-table
+    counts on the same connection must still catch them."""
+    from integration import test_it3
+    _, work = it_env("it3", foreign_rows_after_rollback=True)
+    with pytest.raises(AssertionError, match="explain rows remain after rollback"):
+        test_it3.test_it3_production_guard_analysis()
+    r = results(work, "it3")
+    assert r["outcome"] == "failed" and sum(r["leftover_counts"].values()) > 0
+
+
+def test_it3_fake_reports_dynamic_sql_metadata_as_null_like_db2(it_env):
+    from integration import test_it3
+    fake, work = it_env("it3")
+    test_it3.test_it3_production_guard_analysis()
+    assert fake.state.cache and all(e[4:8] == [None, None, None, None] for e in fake.state.cache)
+    assert results(work, "it3")["outcome"] == "passed"
+
+
+def test_it3_also_passes_when_the_cache_reports_complete_package_metadata(it_env):
+    from integration import test_it3
+    fake, work = it_env("it3", package_metadata=True)
+    test_it3.test_it3_production_guard_analysis()
+    assert all(e[4:7] == ["NULLID", "SYSSH200", ""] and type(e[7]) is int for e in fake.state.cache)
+    assert results(work, "it3")["outcome"] == "passed"

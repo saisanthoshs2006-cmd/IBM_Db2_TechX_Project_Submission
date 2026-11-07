@@ -114,10 +114,16 @@ command calls it, and it refuses to run without a restricted principal and a rea
    On startup a worker runs the read-only preflight and counts the rows in all 11 explain tables;
    if any is non-empty it refuses to start and the pool becomes degraded. Worker stderr goes to a
    redacted, size-bounded log file (`DB2INTEL_WORKER_LOG`).
-4. In the worker: request marker added → `PREPARE` (deferred prepare off) → one package-cache entry
-   with that marker, exact text, zero executions → cost limit → `EXPLAIN_FROM_SECTION` → explain rows
-   located by marker and read by the full explain key → every table and index in the plan must be
-   in an allowed schema → cache entry re-checked → `ROLLBACK` → leftover explain rows counted.
+4. In the worker: request marker added → `PREPARE` (deferred prepare off) → one dynamic package-cache entry
+   with that marker, exact text and zero executions → cost limit → no explain row may carry the marker yet →
+   `EXPLAIN_FROM_SECTION` as a
+   prepared `CALL` whose statement timeout (`query.timeout_seconds`) must read back from the
+   statement handle before it runs → exactly one original-level explain row located by marker, with
+   the exact prepared text and the session user as requester → when Db2 returns package metadata,
+   cross-check its identity and section; for dynamic SQL, Db2 returns those metadata fields as NULL,
+   so the guard relies on the exact executable ID, unique marker, statement text and resolved explain
+   row instead → exactly one explain instance for that key → every table and index in the plan must
+   be in an allowed schema → cache entry re-checked → `ROLLBACK` → leftover explain rows counted.
 5. The decision (`APPROVED`, `BLOCKED`, `COST_REJECTED` or `ERROR`) is validated by the parent and
    returned with cost, plan objects and operators. Nothing is executed or committed.
 6. If the worker misses its deadline, the whole process group is killed with SIGKILL (Db2 rolls back
@@ -192,12 +198,21 @@ Key Db2 statements used by the guard (all reads, plus the explain procedure whos
 back):
 
 ```sql
-SELECT HEX(EXECUTABLE_ID), QUERY_COST_ESTIMATE, NUM_EXECUTIONS, STMT_TEXT
+SELECT HEX(EXECUTABLE_ID), QUERY_COST_ESTIMATE, NUM_EXECUTIONS, STMT_TEXT,
+       RTRIM(PACKAGE_SCHEMA), RTRIM(PACKAGE_NAME), RTRIM(PACKAGE_VERSION_ID), SECTION_NUMBER
 FROM TABLE(MON_GET_PKG_CACHE_STMT('D', NULL, NULL, -2)) AS T
 WHERE STMT_TEXT LIKE ? ESCAPE '!';
+-- Dynamic SQL has NULL package schema, name, version and section number; verify the exact
+-- executable ID and marker-tagged statement text, then resolve the EXPLAIN key from its row.
 
--- via ibm_db.callproc; the executable id comes from the package-cache lookup above
-CALL SYSPROC.EXPLAIN_FROM_SECTION(?, 'M', NULL, -1, 'DB2INTEL', ?, ?, ?, ?, ?);
+-- prepared with SQL_ATTR_QUERY_TIMEOUT = query.timeout_seconds, which must read back from the
+-- statement handle before execution; inputs: executable id, 'M', NULL, -1, 'DB2INTEL' (INOUT)
+CALL SYSPROC.EXPLAIN_FROM_SECTION(?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- ibm_db returns no OUT values from a prepared CALL, so the instance is located by the marker
+SELECT RTRIM(EXPLAIN_REQUESTER), VARCHAR(EXPLAIN_TIME), RTRIM(SOURCE_NAME), RTRIM(SOURCE_SCHEMA),
+       RTRIM(SOURCE_VERSION), STMTNO, SECTNO, STATEMENT_TEXT FROM DB2INTEL.EXPLAIN_STATEMENT
+WHERE EXPLAIN_LEVEL = 'O' AND STATEMENT_TEXT LIKE ? ESCAPE '!';
 
 SELECT RTRIM(OBJECT_SCHEMA), RTRIM(OBJECT_NAME), RTRIM(OBJECT_TYPE), EXPLAIN_LEVEL, STMTNO, SECTNO
 FROM DB2INTEL.EXPLAIN_OBJECT

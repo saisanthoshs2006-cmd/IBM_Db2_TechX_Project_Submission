@@ -447,7 +447,7 @@ def test_db2_marker_is_registered_and_markers_are_strict():
     assert "--strict-markers" in cfg["addopts"]
 
 
-INTEGRATION_TESTS = 3  # test_placeholder, test_it1, test_it2 (G2.0)
+INTEGRATION_TESTS = 4  # test_placeholder, test_it1, test_it2 (G2.0), test_it3 (G2.4)
 
 
 def _run_pytest(args, cwd, extra_env=None):

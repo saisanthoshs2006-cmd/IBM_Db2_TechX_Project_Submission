@@ -3,17 +3,30 @@
 Steps, all on one analysis connection that never commits:
   1. static guard (parser.guard_sql): one read-only SELECT over allowed schemas, row cap added
   2. PREPARE only (deferred prepare off): Db2 compiles the statement; nothing is executed
-  3. package cache: exactly one entry carrying this request's marker, with exactly the prepared
-     text, never executed; its QUERY_COST_ESTIMATE must be within the limit
-  4. SYSPROC.EXPLAIN_FROM_SECTION on that entry. Its rows are located through the request
-     marker in EXPLAIN_STATEMENT.STATEMENT_TEXT (exactly one original-level row), not through
-     the OUT timestamp, which ibm_db does not return (Phase 2B probe, 2026-11-06). Requester,
-     source name/schema/version must equal the OUT values, a returned timestamp must equal the
-     row's, exactly one EXPLAIN_INSTANCE row must exist, and every statement, object and
-     operator row read must belong to that instance and statement.
+  3. package cache, dynamic statements only (MON_GET_PKG_CACHE_STMT('D', ...)): exactly one
+     entry carrying this request's marker, with exactly the prepared text and a valid executable
+     id, never executed; its QUERY_COST_ESTIMATE must be within the limit. Its package metadata
+     (PACKAGE_SCHEMA, PACKAGE_NAME, PACKAGE_VERSION_ID, SECTION_NUMBER) is accepted in exactly
+     two shapes: all four NULL, as Db2 reports for dynamic SQL (seen on Db2 12.1.5 in G2.4), or
+     complete (schema and name non-empty, version NULL or text, section a non-negative integer).
+     Any partial or malformed shape is BLOCKED. No explain row may carry the marker yet.
+  4. SYSPROC.EXPLAIN_FROM_SECTION on that entry, as a prepared CALL whose statement timeout is
+     the configured query.timeout_seconds and is read back from the statement handle before it
+     runs (G2.3: callproc cannot take a statement timeout, a connection default does not reach
+     it, and a prepared CALL returns no OUT values through ibm_db 3.3.0). Its rows are located
+     through the request marker in EXPLAIN_STATEMENT.STATEMENT_TEXT: exactly one original-level
+     row, whose text must equal the prepared text, whose requester must be the session user,
+     whose source schema and name must be non-empty, whose source version must be NULL or text,
+     and whose section number and EXPLAIN_TIME must be readable. When the cache entry carried
+     package metadata, the row's source schema/name/version and section number must also equal
+     it; with all-NULL dynamic metadata, the row's identity rests on the unique marker (absent
+     before EXPLAIN), the exact text, the session user and the single row and instance.
+     Exactly one EXPLAIN_INSTANCE row must exist for the resolved key, and every statement,
+     object and operator row read must belong to that instance and statement.
      The section-level cost must be within the limit and every table and index the plan
      touches must belong to an allowed schema.
-  5. the cache entry is checked again (still unique, still never executed)
+  5. the cache entry is checked again: same executable id and the same package metadata
+     (all-NULL stays all-NULL), still unique, exact text, never executed
   6. ROLLBACK on every path, then reads prove the explain rows are gone: EXPLAIN_STATEMENT by
      the request marker; EXPLAIN_INSTANCE, EXPLAIN_OBJECT and EXPLAIN_OPERATOR by the resolved
      explain key, or (if the key was never resolved) by a count of the whole table. Any row left,
@@ -38,10 +51,14 @@ from db2intel.guard.parser import _schema_denied, guard_sql
 APPROVED, BLOCKED, COST_REJECTED, ERROR = "APPROVED", "BLOCKED", "COST_REJECTED", "ERROR"
 
 CACHE_LOOKUP_SQL = (
-    "SELECT HEX(EXECUTABLE_ID), QUERY_COST_ESTIMATE, NUM_EXECUTIONS, STMT_TEXT "
+    "SELECT HEX(EXECUTABLE_ID), QUERY_COST_ESTIMATE, NUM_EXECUTIONS, STMT_TEXT, "
+    "RTRIM(PACKAGE_SCHEMA), RTRIM(PACKAGE_NAME), RTRIM(PACKAGE_VERSION_ID), SECTION_NUMBER "
     "FROM TABLE(MON_GET_PKG_CACHE_STMT('D', NULL, NULL, -2)) AS T "
     "WHERE STMT_TEXT LIKE ? ESCAPE '!'"
 )
+# The only CALL the guard sends. Run as a prepared statement so it can carry a query timeout.
+EXPLAIN_CALL_SQL = "CALL SYSPROC.EXPLAIN_FROM_SECTION(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+QUERY_TIMEOUT_SQLSTATE = "57014"  # SQL0952N: processing was cancelled (query timeout)
 _KEY_WHERE = (
     "WHERE EXPLAIN_REQUESTER = ? AND EXPLAIN_TIME = ? AND SOURCE_NAME = ? "
     "AND SOURCE_SCHEMA = ? AND SOURCE_VERSION = ?"
@@ -49,7 +66,7 @@ _KEY_WHERE = (
 # Locate this request's explain rows by its unique marker (original-level statement text).
 EXPLAIN_LOCATE_SQL = (
     "SELECT RTRIM(EXPLAIN_REQUESTER), VARCHAR(EXPLAIN_TIME), RTRIM(SOURCE_NAME), RTRIM(SOURCE_SCHEMA), "
-    "RTRIM(SOURCE_VERSION), STMTNO, SECTNO FROM DB2INTEL.EXPLAIN_STATEMENT "
+    "RTRIM(SOURCE_VERSION), STMTNO, SECTNO, STATEMENT_TEXT FROM DB2INTEL.EXPLAIN_STATEMENT "
     "WHERE EXPLAIN_LEVEL = 'O' AND STATEMENT_TEXT LIKE ? ESCAPE '!'"
 )
 EXPLAIN_INSTANCE_SQL = f"SELECT COUNT(*) FROM DB2INTEL.EXPLAIN_INSTANCE {_KEY_WHERE}"
@@ -78,10 +95,14 @@ INDEX_TABLE_SQL = "SELECT RTRIM(TABSCHEMA), RTRIM(TABNAME) FROM SYSCAT.INDEXES W
 _HEX_ID_RE = re.compile(r"^(?:[0-9A-F]{2}){1,64}$")
 
 
+class ExplainTimeoutUnconfirmed(DbError):
+    """The EXPLAIN statement's query timeout could not be set and read back; it is not run."""
+
+
 @dataclass(frozen=True)
 class ExplainKey:
-    """Identifies an explain instance. From the driver's OUT parameters `time` may be empty
-    (ibm_db returns None for the TIMESTAMP OUT); the resolved key always carries the row's time."""
+    """Identifies an explain instance (the key columns of every explain table). The guard builds
+    it from the marker-located EXPLAIN_STATEMENT row after cross-checking that row."""
 
     explain_schema: str
     requester: str
@@ -99,8 +120,25 @@ class AnalysisSession(Protocol):
 
     def prepare_only(self, sql: str) -> int: ...
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[tuple]: ...
-    def explain_from_section(self, executable_id_hex: str, explain_schema: str) -> ExplainKey: ...
+    def explain_section(self, executable_id_hex: str, explain_schema: str, timeout_seconds: int) -> None: ...
     def rollback(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class CacheEntry:
+    """The unique dynamic SQL package-cache entry for a prepared statement.
+
+    Db2 reports package schema/name/version and section number as NULL for dynamic SQL. When
+    those fields are present, retain them for cross-checking; otherwise the exact executable ID,
+    marker, statement text, requester and EXPLAIN row association provide the identity checks.
+    """
+
+    hexid: str
+    cost: float
+    package_schema: str | None
+    package_name: str | None
+    package_version: str | None
+    section: int | None
 
 
 @dataclass(frozen=True)
@@ -171,13 +209,28 @@ def _number(value, what: str) -> float:
     return number
 
 
-def _cache_entry(session: AnalysisSession, marker: str, prepared: str) -> tuple[str, float]:
+def _section_number(value) -> int | None:
+    """SECTNO / SECTION_NUMBER as a non-negative int, or None if it is not one."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0 or (not isinstance(value, int) and str(value).strip() != str(number)):
+        return None
+    return number
+
+
+def _cache_entry(session: AnalysisSession, marker: str, prepared: str) -> CacheEntry:
     rows = session.query(CACHE_LOOKUP_SQL, (like_pattern(marker),))
     if not rows:
         raise _Stop(BLOCKED, "cache_missing", "the prepared statement is not in the package cache (missing or expired)")
     if len(rows) != 1:
         raise _Stop(BLOCKED, "cache_ambiguous", f"{len(rows)} package cache entries carry this request marker")
-    hexid, cost, executions, text = rows[0]
+    if len(rows[0]) != 8:
+        raise _Stop(BLOCKED, "cache_unexpected", "package cache entry has an unexpected shape")
+    hexid, cost, executions, text, pkg_schema, pkg_name, pkg_version, section = rows[0]
     hexid = str(hexid or "").strip().upper()
     if not _HEX_ID_RE.match(hexid):
         raise _Stop(BLOCKED, "cache_unexpected", "package cache entry has no valid executable id")
@@ -185,26 +238,48 @@ def _cache_entry(session: AnalysisSession, marker: str, prepared: str) -> tuple[
         raise _Stop(BLOCKED, "cache_text_mismatch", "package cache text differs from the prepared statement")
     if executions != 0:
         raise _Stop(BLOCKED, "already_executed", "package cache shows the statement was executed")
-    return hexid, _number(cost, "package cache cost estimate")
+    # This function is explicitly restricted to dynamic SQL by MON_GET_PKG_CACHE_STMT('D', ...).
+    # Db2 documents PACKAGE_SCHEMA, PACKAGE_NAME, PACKAGE_VERSION_ID and SECTION_NUMBER as NULL
+    # for dynamic statements. Accept that all-NULL shape only; reject partial or malformed
+    # metadata so a future query change cannot silently broaden this exception.
+    metadata = (pkg_schema, pkg_name, pkg_version, section)
+    if all(value is None for value in metadata):
+        identity = (None, None, None, None)
+    else:
+        if not (isinstance(pkg_schema, str) and pkg_schema.strip()
+                and isinstance(pkg_name, str) and pkg_name.strip()
+                and (pkg_version is None or isinstance(pkg_version, str))):
+            raise _Stop(BLOCKED, "cache_unexpected", "package cache metadata is partial or malformed")
+        section_number = _section_number(section)
+        if section_number is None:
+            raise _Stop(BLOCKED, "cache_unexpected", "package cache entry has no valid section number")
+        identity = (pkg_schema.strip(), pkg_name.strip(),
+                    (pkg_version or "").strip(), section_number)
+    return CacheEntry(hexid, _number(cost, "package cache cost estimate"), *identity)
 
 
-def _check_key(key: ExplainKey, explain_schema: str) -> None:
-    """Validate the OUT parameters. The timestamp may be empty; everything else is required."""
-    if not isinstance(key, ExplainKey) or str(key.explain_schema).strip() != explain_schema:
-        raise _Stop(BLOCKED, "explain_unexpected", "EXPLAIN_FROM_SECTION wrote to an unexpected explain schema")
-    if not all(isinstance(v, str) and v.strip() for v in (key.requester, key.source_name, key.source_schema)):
-        raise _Stop(BLOCKED, "explain_unexpected", "EXPLAIN_FROM_SECTION did not return its identifying keys")
-    if not isinstance(key.source_version, str) or not isinstance(key.time, str):
-        raise _Stop(BLOCKED, "explain_unexpected", "EXPLAIN_FROM_SECTION did not return its identifying keys")
+def _check_no_marked_rows(session: AnalysisSession, marker: str) -> None:
+    """Before EXPLAIN: no explain row may carry this request's marker, so the row found after
+    EXPLAIN can only have been written by this request's own EXPLAIN."""
+    rows = session.query(EXPLAIN_LEFTOVER_SQL, (like_pattern(marker),))
+    count = rows[0][0] if len(rows) == 1 and len(rows[0]) == 1 else None
+    if type(count) is not int or count < 0:
+        raise _Stop(BLOCKED, "explain_unexpected", "could not confirm that no explain row carries this request marker")
+    if count:
+        raise _Stop(BLOCKED, "explain_preexisting", f"{count} explain rows already carry this request marker")
 
 
-def _explain(session: AnalysisSession, hexid: str, ctx: GuardContext) -> ExplainKey:
+def _explain(session: AnalysisSession, entry: CacheEntry, ctx: GuardContext) -> None:
     try:
-        key = session.explain_from_section(hexid, ctx.explain_schema)
+        session.explain_section(entry.hexid, ctx.explain_schema, ctx.limits.timeout_seconds)
+    except ExplainTimeoutUnconfirmed as exc:
+        raise _Stop(BLOCKED, "explain_timeout_unconfirmed", f"EXPLAIN_FROM_SECTION not run: {exc}", exc.sqlstate) from None
     except DbError as exc:
+        if exc.sqlstate == QUERY_TIMEOUT_SQLSTATE:
+            raise _Stop(BLOCKED, "explain_timeout",
+                        f"EXPLAIN_FROM_SECTION exceeded the {ctx.limits.timeout_seconds} s query timeout",
+                        exc.sqlstate) from None
         raise _Stop(BLOCKED, "explain_failed", f"EXPLAIN_FROM_SECTION failed: {exc}", exc.sqlstate) from None
-    _check_key(key, ctx.explain_schema)
-    return key
 
 
 def _timestamp_digits(value) -> str | None:
@@ -218,33 +293,52 @@ def _timestamp_digits(value) -> str | None:
     return digits.ljust(26, "0")
 
 
-def _locate(session: AnalysisSession, marker: str, out: ExplainKey) -> tuple[ExplainKey, tuple]:
-    """Find this request's explain instance through the marker and cross-check it."""
+def _locate(session: AnalysisSession, marker: str, prepared: str, entry: CacheEntry,
+            ctx: GuardContext) -> tuple[ExplainKey, tuple]:
+    """Find this request's explain instance through the marker and cross-check it against the
+    prepared text, the session user and the package cache entry that was explained."""
     rows = session.query(EXPLAIN_LOCATE_SQL, (like_pattern(marker),))
     if not rows:
         raise _Stop(BLOCKED, "explain_rows_missing", "no explain statement row carries this request marker")
     if len(rows) != 1:
         raise _Stop(BLOCKED, "explain_ambiguous", f"{len(rows)} explain statement rows carry this request marker")
-    requester, etime, source_name, source_schema, source_version, stmtno, sectno = rows[0]
-    found = {
-        "requester": str(requester or "").strip(), "source name": str(source_name or "").strip(),
-        "source schema": str(source_schema or "").strip(), "source version": str(source_version or "").strip(),
-    }
-    expected = {
-        "requester": out.requester.strip(), "source name": out.source_name.strip(),
-        "source schema": out.source_schema.strip(), "source version": out.source_version.strip(),
-    }
-    differ = [name for name in found if found[name] != expected[name]]
+    if len(rows[0]) != 8:
+        raise _Stop(BLOCKED, "explain_unexpected", "explain statement row has an unexpected shape")
+    requester, etime, source_name, source_schema, source_version, stmtno, sectno, text = rows[0]
+    if text != prepared:
+        raise _Stop(BLOCKED, "explain_text_mismatch", "the marked explain row's text differs from the prepared statement")
+    differ = []
+    if not isinstance(requester, str) or requester.strip() != ctx.session_user.strip():
+        differ.append("requester")
+    if not isinstance(source_name, str) or not source_name.strip():
+        differ.append("source name (empty)")
+    if not isinstance(source_schema, str) or not source_schema.strip():
+        differ.append("source schema (empty)")
+    if source_version is not None and not isinstance(source_version, str):
+        differ.append("source version (unreadable)")
+    if entry.package_schema is not None:
+        if not isinstance(source_schema, str) or source_schema.strip() != entry.package_schema:
+            differ.append("source schema")
+        if not isinstance(source_name, str) or source_name.strip() != entry.package_name:
+            differ.append("source name")
+        found_version = source_version.strip() if isinstance(source_version, str) else ""
+        if found_version != entry.package_version:
+            differ.append("source version")
+    section_number = _section_number(sectno)
+    if section_number is None:
+        differ.append("section number")
+    elif entry.section is not None and section_number != entry.section:
+        differ.append("section number")
+    if not (isinstance(requester, str) and requester.strip()):
+        differ.append("requester (empty)")
     row_time = _timestamp_digits(etime)
     if row_time is None:
         differ.append("explain time (missing in row)")
-    elif out.time.strip() and _timestamp_digits(out.time) != row_time:
-        differ.append("explain time")
     if differ:
         raise _Stop(BLOCKED, "explain_key_mismatch",
-                    f"explain row does not match EXPLAIN_FROM_SECTION output: {', '.join(differ)}")
-    key = ExplainKey(out.explain_schema, found["requester"], str(etime).strip(), found["source name"],
-                     found["source schema"], found["source version"])
+                    f"explain row does not match the explained package cache entry: {', '.join(differ)}")
+    key = ExplainKey(ctx.explain_schema, requester.strip(), str(etime).strip(), source_name.strip(),
+                     source_schema.strip(), "" if source_version is None else source_version.strip())
     instances = session.query(EXPLAIN_INSTANCE_SQL, key.params())
     if not instances or instances[0][0] != 1:
         count = instances[0][0] if instances else 0
@@ -327,23 +421,26 @@ def analyze(sql: str, session: AnalysisSession, ctx: GuardContext, request_id: s
         if not isinstance(columns, int) or columns < 1:
             raise _Stop(BLOCKED, "no_result_set", "the statement does not describe a result set")
 
-        hexid, cache_cost = _cache_entry(session, marker, prepared)
-        result["estimated_cost"] = cache_cost
-        if cache_cost > ctx.limits.max_estimated_cost:
+        entry = _cache_entry(session, marker, prepared)
+        result["estimated_cost"] = entry.cost
+        if entry.cost > ctx.limits.max_estimated_cost:
             raise _Stop(COST_REJECTED, "cost_too_high",
-                        f"estimated cost {cache_cost:,.0f} timerons exceeds the limit {ctx.limits.max_estimated_cost:,.0f}")
+                        f"estimated cost {entry.cost:,.0f} timerons exceeds the limit {ctx.limits.max_estimated_cost:,.0f}")
+        _check_no_marked_rows(session, marker)
 
         explained = True
-        out = _explain(session, hexid, ctx)
-        key, stmt_id = _locate(session, marker, out)
+        _explain(session, entry, ctx)
+        key, stmt_id = _locate(session, marker, prepared, entry, ctx)
         explain_cost, objects, plan = _read_plan(session, key, stmt_id, prepared, ctx)
         result.update(explain_cost=explain_cost, objects=objects, plan=plan)
         if explain_cost > ctx.limits.max_estimated_cost:
             raise _Stop(COST_REJECTED, "cost_too_high",
                         f"explained cost {explain_cost:,.0f} timerons exceeds the limit {ctx.limits.max_estimated_cost:,.0f}")
 
-        hexid_again, _ = _cache_entry(session, marker, prepared)
-        if hexid_again != hexid:
+        entry_again = _cache_entry(session, marker, prepared)
+        if (entry_again.hexid, entry_again.package_schema, entry_again.package_name, entry_again.package_version,
+                entry_again.section) != (entry.hexid, entry.package_schema, entry.package_name,
+                                         entry.package_version, entry.section):
             raise _Stop(BLOCKED, "cache_unexpected", "package cache entry changed during analysis")
     except _Stop as exc:
         stop = exc

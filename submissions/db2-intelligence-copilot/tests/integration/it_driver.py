@@ -4,11 +4,13 @@ install() replaces sys.modules["ibm_db"] in the current process, so Db2Connectio
 sessions (which import ibm_db lazily) get this proxy. Every refusal happens before the real
 driver is called.
 
-  prepare     only statements listed in it_sql (exact text) or the marked PK lookup; every
-              prepared statement gets SQL_ATTR_QUERY_TIMEOUT, and the value must read back from
-              the statement handle, otherwise the statement is freed and the call refused
+  prepare     only statements listed in it_sql (exact text) or a marked statement whose body is
+              listed (it_sql.is_allowed_marked); every prepared statement gets
+              SQL_ATTR_QUERY_TIMEOUT (the caller's value if it gives a valid one, else the run's),
+              and the value must read back from the statement handle, otherwise the statement is
+              freed and the call refused
   execute     only statements prepared from it_sql.EXECUTABLE_SQL (the SELECTs and the CALL);
-              the marked PK lookup and the IT1 probe can be prepared, never executed
+              marked statements and the IT1 probe can be prepared, never executed
   bind_param  only on the prepared CALL; inputs must be (id, 'M', NULL, -1, 'DB2INTEL'),
               parameters 6-10 outputs
   callproc    only SYSPROC.EXPLAIN_FROM_SECTION with the same inputs
@@ -81,7 +83,7 @@ class GuardedDriver:
     @staticmethod
     def allowed_to_prepare(sql) -> bool:
         return isinstance(sql, str) and (sql in Q.EXECUTABLE_SQL or sql in Q.PREPARE_ONLY_SQL
-                                         or Q.MARKED_PK_LOOKUP_RE.match(sql) is not None)
+                                         or Q.is_allowed_marked(sql))
 
     def prepare(self, conn, sql, options=None):
         return self._prepare(conn, sql, options, with_timeout=True)
@@ -98,18 +100,22 @@ class GuardedDriver:
             raise DriverRefused("prepare refused: statement is not on the G2 allow-list")
         db = self._real
         opts = dict(options or {})
+        requested = None
         if with_timeout:
-            opts[db.SQL_ATTR_QUERY_TIMEOUT] = self.timeout
+            requested = opts.get(db.SQL_ATTR_QUERY_TIMEOUT, self.timeout)
+            if type(requested) is not int or not 1 <= requested <= MAX_TIMEOUT_S:
+                raise DriverRefused(f"prepare refused: query timeout must be 1..{MAX_TIMEOUT_S} seconds")
+            opts[db.SQL_ATTR_QUERY_TIMEOUT] = requested
         stmt = db.prepare(conn, sql, opts) if opts else db.prepare(conn, sql)
         if not stmt:
             return stmt
         if with_timeout:
             got = db.get_option(stmt, db.SQL_ATTR_QUERY_TIMEOUT, 0)
-            if isinstance(got, bool) or got != self.timeout:
+            if isinstance(got, bool) or got != requested:
                 try:
                     db.free_stmt(stmt)
                 finally:
-                    raise DriverRefused(f"statement query timeout reads back {got!r}, expected {self.timeout}")
+                    raise DriverRefused(f"statement query timeout reads back {got!r}, expected {requested}")
         self._stmts[id(stmt)] = (stmt, sql)
         self.log.append(("prepare", sql))
         return stmt

@@ -6,6 +6,8 @@ Never connects to Db2 and never imports ibm_db: every Db2 contact happens in a c
   --step snapshot   G2.1: one snapshot (pre.json) and the baseline check. Nothing else.
   --step it1        G2.2: pre-snapshot -> pytest tests/integration/test_it1.py -> post-snapshot
   --step it2        G2.3: pre-snapshot -> pytest tests/integration/test_it2.py -> post-snapshot
+  --step it3        G2.4: pre-snapshot -> pytest tests/integration/test_it3.py -> post-snapshot
+                    (the production guard's preflight and analyze() through the guarded driver)
 
 For it1/it2 the test only starts if the baseline is exact (server TESTDB, all 11 explain tables
 empty, QUERY_AUDIT empty, ledger 001-003, employee fingerprints as recorded). The post-snapshot
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.util
 import json
 import os
 import signal
@@ -39,7 +42,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TEST_DEADLINE_S = 240
 SNAPSHOT_DEADLINE_S = 60
 KILL_REPORT_S = 30
-STEPS = ("snapshot", "it1", "it2")
+STEPS = ("snapshot", "it1", "it2", "it3")
 RUN_DIR_ENV = "DB2INTEL_IT_RUN_DIR"
 STEP_ENV = "DB2INTEL_IT_STEP"
 MATCH_CONDITIONS = ("server_matches", "explain_counts_match", "query_audit_matches", "ledger_matches",
@@ -226,7 +229,7 @@ def decide(facts: dict) -> tuple[str, dict[str, bool], dict]:
 
 # ---- run ----------------------------------------------------------------------------------------
 def new_facts(step: str, deadline: float, snapshot_deadline: float) -> dict:
-    return {"step": step, "deadline_s": deadline, "snapshot_deadline_s": snapshot_deadline,
+    return {"step": step, "python": sys.executable, "deadline_s": deadline, "snapshot_deadline_s": snapshot_deadline,
             "pre_snapshot": None, "pre_error": "pre-snapshot was not taken", "baseline_problems": None,
             "test": None, "results": None, "post_snapshot": None, "post_error": "post-snapshot was not taken",
             "interrupted": False}
@@ -320,6 +323,14 @@ def commands(step: str, workdir: Path, query_timeout: int):
     return test_cmd, snapshot_cmd, test_env, base_env
 
 
+def _ibm_db_installed() -> bool:
+    """Whether this interpreter (the one the children run under) can import ibm_db; never imports it."""
+    try:
+        return importlib.util.find_spec("ibm_db") is not None
+    except ValueError:  # already in sys.modules without a spec: it is importable
+        return sys.modules.get("ibm_db") is not None
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--step", choices=STEPS, required=True)
@@ -331,6 +342,10 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.query_timeout >= min(args.deadline, args.snapshot_deadline):
         parser.error("--query-timeout must be shorter than both deadlines")
+    if not _ibm_db_installed():
+        print(f"[supervisor] NOT STARTED: ibm_db is not installed for {sys.executable}; run the supervisor with "
+              "the project environment, e.g. ~/.venvs/db2-intelligence-copilot/bin/python", flush=True)
+        return EXIT_CODES[NOT_STARTED]
     workdir = args.workdir.resolve()
     if workdir == PROJECT_ROOT or PROJECT_ROOT in workdir.parents:
         parser.error("--workdir must be outside the project directory (run evidence is never committed)")

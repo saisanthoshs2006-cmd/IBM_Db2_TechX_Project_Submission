@@ -68,7 +68,8 @@ def test_new_modules_never_reference_execution(path):
 def test_nl2sql_and_rag_cannot_reach_a_database_or_the_worker(path):
     used = _names_used(path)
     forbidden = {"ibm_db", "db2intel.db.connection", "Db2Connection", "db2intel.guard.analysis", "analyze",
-                 "prepare_only", "explain_from_section", "db2intel.guard.worker", "GuardPool", "check"}
+                 "prepare_only", "explain_from_section", "explain_section", "db2intel.guard.worker", "GuardPool",
+                 "check"}
     assert not (used & forbidden), sorted(used & forbidden)
 
 
@@ -107,6 +108,7 @@ def tripwires(monkeypatch):
     monkeypatch.setattr(sessions.Db2ExecutionSession, "execute_capped", trip("execute_capped"))
     monkeypatch.setattr(sessions.Db2AnalysisSession, "prepare_only", trip("prepare_only"))
     monkeypatch.setattr(sessions.Db2AnalysisSession, "explain_from_section", trip("explain_from_section"))
+    monkeypatch.setattr(sessions.Db2AnalysisSession, "explain_section", trip("explain_section"))
     monkeypatch.setattr(analysis, "analyze", trip("analyze"))
     monkeypatch.setattr(connection.Db2Connection, "__init__", trip("Db2Connection"))
     monkeypatch.setattr(W.GuardWorker, "__init__", trip("GuardWorker"))

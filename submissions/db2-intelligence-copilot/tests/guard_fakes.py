@@ -28,18 +28,19 @@ def no_db_driver(monkeypatch):
 
 
 ROW_TIME = "2026-11-06-15.30.00.123456"  # VARCHAR(EXPLAIN_TIME) of the rows EXPLAIN writes
+PACKAGE = ("NULLID", "SYSSH200", "")  # (schema, name, version) of the CLI package, as on Db2 12.1.5
 
 
 def key(schema="DB2INTEL", **over):
-    """Driver OUT values. Default time "" mirrors ibm_db, which returned None for EXPLAIN_TIME."""
-    values = dict(requester="DB2INST1", time="", source_name="SYSSH200", source_schema="NULLID", source_version="")
+    values = dict(requester="DB2INST1", time=ROW_TIME, source_name="SYSSH200", source_schema="NULLID", source_version="")
     values.update(over)
     return A.ExplainKey(schema, values["requester"], values["time"], values["source_name"],
                         values["source_schema"], values["source_version"])
 
 
 def resolved(**over):
-    return key(time=over.pop("time", ROW_TIME), **over)
+    """The explain key the guard resolves from the marked row (and every keyed read uses)."""
+    return key(**over)
 
 
 def _with_statement(rows, n, section=(1, 1)):
@@ -48,7 +49,7 @@ def _with_statement(rows, n, section=(1, 1)):
 
 
 class FakeAnalysis:
-    """Models prepare-only, the package cache, EXPLAIN_FROM_SECTION and rollback.
+    """Models prepare-only, the package cache, the bounded EXPLAIN_FROM_SECTION CALL and rollback.
 
     The package cache is a list of entries; lookups filter by the LIKE pattern exactly as Db2
     would (marker substring), so an entry with the same SQL text but no marker never matches.
@@ -57,13 +58,17 @@ class FakeAnalysis:
     Presence is tracked per table, so a rollback can be made to leave rows in any one table
     (rollback_keeps), and other committed rows can be placed in a table (foreign_rows) to show
     that whole-table cleanup counts see them. cleanup_error_on names a table whose post-rollback
-    count fails.
+    count fails. Package cache entries carry the package identity `package` and section number
+    `cache_section` (default: the explain rows' SECTNO); `locate_over` changes fields of the
+    marked EXPLAIN_STATEMENT row (requester, time, source_name, source_schema, source_version,
+    sectno, text); `marked_rows_before` puts marked rows in place before EXPLAIN.
     """
 
     TABLES = ("EXPLAIN_STATEMENT", "EXPLAIN_INSTANCE", "EXPLAIN_OBJECT", "EXPLAIN_OPERATOR")
 
     def __init__(self, *, columns=1, cost=177.0, executions=0, explain_cost=176.5, extra_cache=(),
-                 statements=None, objects=None, operators=None, index_owners=None, explain_key=None,
+                 statements=None, objects=None, operators=None, index_owners=None, locate_over=None,
+                 package=PACKAGE, cache_section="<sectno>", package_after_explain=None, marked_rows_before=0,
                  prepare_error=None, explain_error=None, query_error_on=None, rollback_error=None,
                  rollback_keeps_rows=False, cache_text=None, evict_after_explain=False,
                  executions_after_explain=None, hexid_after_explain=None, duplicate=False, missing=False,
@@ -92,15 +97,14 @@ class FakeAnalysis:
         self.prepared.append(sql)
         return self.columns
 
-    def explain_from_section(self, hexid, schema):
-        self.calls.append(("explain_from_section", hexid, schema))
+    def explain_section(self, hexid, schema, timeout_seconds):
+        self.calls.append(("explain_section", hexid, schema, timeout_seconds))
         if self.explain_error and not self.explain_error_after_write:
             raise self.explain_error
         self.explained = True
         self.present = set(self.TABLES) if self.explain_writes else set()
         if self.explain_error:
             raise self.explain_error
-        return self.explain_key if self.explain_key is not None else key(schema)
 
     def rollback(self):
         self.calls.append(("rollback",))
@@ -126,6 +130,8 @@ class FakeAnalysis:
             raise DbError("simulated cleanup check failure SQLSTATE=40001", "40001")
         if cleanup_table and self.cleanup_result is not None:
             return self.cleanup_result
+        if sql == A.EXPLAIN_LEFTOVER_SQL and not self.explained:  # the pre-EXPLAIN check
+            return [(self.marked_rows_before,)]
         if sql == A.EXPLAIN_LEFTOVER_SQL:
             marker = self._marker(params[0])
             text = self.prepared[-1] if self.prepared else ""
@@ -139,9 +145,15 @@ class FakeAnalysis:
             if self.locate_rows is not None:
                 return self.locate_rows
             marker = self._marker(params[0])
+            if marker not in self.prepared[-1]:
+                return []
             k = resolved()
-            return [(k.requester, ROW_TIME, k.source_name, k.source_schema, k.source_version, *self.section)] \
-                if marker in self.prepared[-1] else []
+            row = dict(requester=k.requester, time=ROW_TIME, source_name=k.source_name, source_schema=k.source_schema,
+                       source_version=k.source_version, stmtno=self.section[0], sectno=self.section[1],
+                       text=self.prepared[-1])
+            row.update(self.locate_over or {})
+            return [(row["requester"], row["time"], row["source_name"], row["source_schema"], row["source_version"],
+                     row["stmtno"], row["sectno"], row["text"])]
         # Remaining reads are by explain key: only the rows EXPLAIN wrote match.
         def rows_exist(table):
             return table in self.present and params == resolved().params()
@@ -195,9 +207,11 @@ class FakeAnalysis:
             text = self.cache_text if self.cache_text is not None else (self.prepared[-1] if self.prepared else "")
             execs = self.executions_after_explain if (after and self.executions_after_explain is not None) else self.executions
             hexid = self.hexid_after_explain if (after and self.hexid_after_explain) else HEXID
-            entries = [(hexid, self.cost, execs, text)]
+            package = self.package_after_explain if (after and self.package_after_explain) else self.package
+            section = self.section[1] if self.cache_section == "<sectno>" else self.cache_section
+            entries = [(hexid, self.cost, execs, text, *package, section)]
             if self.duplicate:
-                entries.append((HEXID[:-2] + "FF", self.cost, 0, text))
+                entries.append((HEXID[:-2] + "FF", self.cost, 0, text, *package, section))
         entries += list(self.extra_cache)
         return [e for e in entries if marker in (e[3] or "")]
 
@@ -213,6 +227,9 @@ _UNSET = object()
 class StubDriver:
     SQL_ATTR_DEFERRED_PREPARE = 1277
     SQL_ATTR_QUERY_TIMEOUT = 0
+    SQL_PARAM_INPUT = 1
+    SQL_PARAM_INPUT_OUTPUT = 2
+    SQL_PARAM_OUTPUT = 4
 
     def __init__(self, rows=(), callproc_result=None, fail=None, num_fields=2, timeout_readback=_UNSET):
         self.calls, self.rows, self.fail, self._num_fields = [], list(rows), fail or {}, num_fields
@@ -250,6 +267,11 @@ class StubDriver:
     def execute(self, stmt, params=None):
         self.calls.append(("execute", stmt))
         self._maybe_fail("execute")
+        return True
+
+    def bind_param(self, stmt, n, value, param_type=None, *rest):
+        self.calls.append(("bind_param", stmt, n, value, param_type))
+        self._maybe_fail("bind_param")
         return True
 
     def fetch_tuple(self, stmt):

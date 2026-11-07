@@ -5,7 +5,7 @@ that is not listed here, and `python -m integration.it_sql` prints the complete 
 
 Kinds:
   SELECT      read-only; prepared and executed
-  PREPARE     prepared (compiled) but never executed: the marked PK lookup, the IT1 probe
+  PREPARE     prepared (compiled) but never executed: the marked guard statements, the IT1 probe
   CALL        SYSPROC.EXPLAIN_FROM_SECTION: writes EXPLAIN rows into DB2INTEL inside the open
               unit of work; they are rolled back and the rollback is verified by counts
 Nothing in G2 commits. There is no INSERT, UPDATE, DELETE, MERGE, DDL, GRANT or SET statement.
@@ -17,6 +17,7 @@ import re
 from db2intel.guard import analysis as A
 from db2intel.guard import context as C
 from db2intel.guard import rules
+from db2intel.guard.parser import guard_sql
 
 EXPLAIN_SCHEMA = "DB2INTEL"
 EXPECTED_DATABASE = "TESTDB"
@@ -42,7 +43,8 @@ PK_LOOKUP = "SELECT C.COMPANY_NAME FROM DB2INTEL_DEMO.CUSTOMER C WHERE C.CUSTOME
 MARKED_PK_LOOKUP_RE = re.compile(r"\A/\* " + re.escape(rules.MARKER_PREFIX) + r"[0-9A-F]{32} \*/ "
                                  + re.escape(PK_LOOKUP) + r"\Z")
 EXPLAIN_PROC = "SYSPROC.EXPLAIN_FROM_SECTION"
-CALL_EXPLAIN_SQL = f"CALL {EXPLAIN_PROC}(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+CALL_EXPLAIN_SQL = A.EXPLAIN_CALL_SQL  # the production guard's bounded CALL (G2.4)
+assert CALL_EXPLAIN_SQL == f"CALL {EXPLAIN_PROC}(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 IT2_SELECTS = {
     "CACHE_LOOKUP (by marker)": A.CACHE_LOOKUP_SQL,
     "EXPLAIN_LOCATE (by marker)": A.EXPLAIN_LOCATE_SQL,
@@ -53,6 +55,45 @@ IT2_SELECTS = {
     "LEFTOVER EXPLAIN_STATEMENT (by marker)": A.EXPLAIN_LEFTOVER_SQL,
 }
 
+# ---- IT3: the production guard (preflight + analyze) on fixed queries ------------------------
+IT3_ALLOWED_SCHEMAS = frozenset({"DB2INTEL_DEMO"})
+IT3_MAX_ROWS = 500  # query.max_rows seeded by migration 001; preflight must report the same
+IT3_QUERIES = (  # (label, user SQL, expected status) -- the Phase 2B end-to-end set
+    ("pk lookup", PK_LOOKUP, A.APPROVED),
+    ("regional report",
+     "SELECT R.REGION_NAME, SUM(I.LINE_AMOUNT) AS NET FROM DB2INTEL_DEMO.ORDER_ITEM I "
+     "JOIN DB2INTEL_DEMO.SALES_ORDER O ON O.ORDER_ID = I.ORDER_ID "
+     "JOIN DB2INTEL_DEMO.CUSTOMER C ON C.CUSTOMER_ID = O.CUSTOMER_ID "
+     "JOIN DB2INTEL_DEMO.REGION R ON R.REGION_ID = C.REGION_ID GROUP BY R.REGION_NAME ORDER BY NET DESC",
+     A.APPROVED),
+    ("view (expanded)", "SELECT SEGMENT, SUM(NET_AMOUNT) FROM DB2INTEL_DEMO.V_ORDER_SUMMARY GROUP BY SEGMENT", A.APPROVED),
+    ("runaway cross join",
+     "SELECT COUNT(*) FROM DB2INTEL_DEMO.ORDER_ITEM A CROSS JOIN DB2INTEL_DEMO.ORDER_ITEM B "
+     "CROSS JOIN DB2INTEL_DEMO.SALES_ORDER S", A.COST_REJECTED),
+    ("protected table", "SELECT * FROM DB2INST1.EMPLOYEE_INFO", A.BLOCKED),  # static: never reaches Db2
+)
+IT3_GUARDED = {label: guard_sql(sql, IT3_ALLOWED_SCHEMAS, IT3_MAX_ROWS).text
+               for label, sql, status in IT3_QUERIES if status != A.BLOCKED}
+IT3_SELECTS = {
+    "preflight STMT_CONC": C.STMT_CONC_SQL,
+    "preflight EXPLAIN tables": C.EXPLAIN_TABLES_SQL,
+    "preflight LIMITS": C.LIMITS_SQL,
+    "preflight SOURCES": C.SOURCES_SQL,
+    "preflight UDF shadowing": C.udf_shadow_sql(len(rules.ALLOWED_FUNCTIONS)),
+    "SYSCAT.INDEXES (index owner)": A.INDEX_TABLE_SQL,
+    "LEFTOVER EXPLAIN_OBJECT (by key)": A.LEFTOVER_BY_KEY_SQL["EXPLAIN_OBJECT"],
+    "LEFTOVER EXPLAIN_OPERATOR (by key)": A.LEFTOVER_BY_KEY_SQL["EXPLAIN_OPERATOR"],
+}
+# Statements that may be prepared (never executed) behind a guard marker.
+MARKED_RE = re.compile(r"\A/\* " + re.escape(rules.MARKER_PREFIX) + r"[0-9A-F]{32} \*/ (?P<body>[^\r\n]+)\Z")
+MARKED_BODIES = frozenset({PK_LOOKUP, *IT3_GUARDED.values()})
+
+
+def is_allowed_marked(sql) -> bool:
+    match = MARKED_RE.match(sql) if isinstance(sql, str) else None
+    return match is not None and match.group("body") in MARKED_BODIES
+
+
 SELECT_SQL: dict[str, str] = {
     "server identity": SERVER_SQL,
     **{f"count DB2INTEL.{t}": sql for t, sql in EXPLAIN_COUNT_SQL.items()},
@@ -60,9 +101,10 @@ SELECT_SQL: dict[str, str] = {
     "migration ledger": LEDGER_SQL,
     **{f"fingerprint DB2INST1.{t}": sql for t, sql in PROTECTED_SQL.items()},
     **IT2_SELECTS,
+    **IT3_SELECTS,
 }
 EXECUTABLE_SQL = frozenset(SELECT_SQL.values()) | {CALL_EXPLAIN_SQL}
-PREPARE_ONLY_SQL = frozenset({IT1_PROBE_SQL})  # plus statements matching MARKED_PK_LOOKUP_RE
+PREPARE_ONLY_SQL = frozenset({IT1_PROBE_SQL})  # plus marked statements (is_allowed_marked)
 
 _WRITE_WORD = re.compile(r"\b(INSERT|UPDATE|DELETE|MERGE|DROP|CREATE|ALTER|GRANT|REVOKE|COMMIT|SET|"
                          r"TRUNCATE|CALL|RUNSTATS|REORG|LOAD|IMPORT|EXPORT)\b", re.I)
@@ -78,7 +120,11 @@ def listing() -> list[tuple[str, str, str]]:
     rows.append(("PREPARE", "IT1 timeout probe (never executed)", IT1_PROBE_SQL))
     rows.append(("PREPARE", "IT2 marked PK lookup (never executed)",
                  f"/* {rules.MARKER_PREFIX}<32 hex digits> */ {PK_LOOKUP}"))
-    rows.append(("CALL", "IT2 prepared CALL (writes EXPLAIN rows, rolled back)", CALL_EXPLAIN_SQL))
+    for label, text in IT3_GUARDED.items():
+        rows.append(("PREPARE", f"IT3 marked guard statement: {label} (never executed)",
+                     f"/* {rules.MARKER_PREFIX}<32 hex digits> */ {text}"))
+    rows.append(("CALL", "IT2/IT3 prepared CALL, statement timeout read back first (writes EXPLAIN rows, rolled back)",
+                 CALL_EXPLAIN_SQL))
     rows.append(("CALL", "IT2 ibm_db.callproc (writes EXPLAIN rows, rolled back)",
                  f"ibm_db.callproc(conn, '{EXPLAIN_PROC}', (<executable id>, 'M', NULL, -1, '{EXPLAIN_SCHEMA}' INOUT, 5 OUT))"))
     rows.append(("ATTR", "statement query timeout (every prepare; read back from the statement)",

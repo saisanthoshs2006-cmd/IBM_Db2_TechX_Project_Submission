@@ -13,6 +13,8 @@ integration code handles every outcome:
   rollback_keeps_rows         explain rows survive rollback (a cleanup failure)
   foreign_rows_after_rollback an explain instance without this run's marker is present after rollback
   vary_prepared_call_cost     the prepared CALL writes a different plan
+  package_metadata            package cache entries report PACKAGE_SCHEMA/NAME/VERSION_ID and
+                              SECTION_NUMBER (default False: all NULL, as Db2 does for dynamic SQL)
 """
 from __future__ import annotations
 
@@ -55,13 +57,17 @@ class FakeStmt:
         self.rows, self.bound, self.freed = [], {}, False
 
 
+DYNAMIC_PACKAGE = ("NULLID", "SYSSH200", "")  # the CLI package EXPLAIN reports as the source
+
+
 class FakeDb2State:
     def __init__(self):
-        self.cache = []  # [hexid, cost, executions, text]
+        self.cache = []  # [hexid, cost, executions, text, package schema, package name, version, section]
         self.pending = []  # explain instances in the open unit of work
         self.committed = []  # explain instances that survived (only with rollback_keeps_rows)
         self.clock = 0
         self.audit_rows = 0
+        self.sections = {}  # hexid -> the section EXPLAIN writes, whatever the cache reports
 
 
 class FakeIbmDb:
@@ -85,6 +91,10 @@ class FakeIbmDb:
         self.vary_prepared_call_cost = knobs.pop("vary_prepared_call_cost", False)
         self.connect_error = knobs.pop("connect_error", None)
         self.server = knobs.pop("server", "TESTDB")
+        self.limit_timeout = knobs.pop("limit_timeout", 30)
+        self.limit_cost = knobs.pop("limit_cost", "50000")  # query.max_estimated_cost
+        self.package_metadata = knobs.pop("package_metadata", False)
+        self.call_read_back = knobs.pop("call_read_back", None)  # what the EXPLAIN CALL's timeout reads back
         assert not knobs, knobs
 
     # -- connection ------------------------------------------------------------------------
@@ -137,6 +147,8 @@ class FakeIbmDb:
             return self.connection_read_back
         if self.statement_read_back is not None:
             return self.statement_read_back
+        if self.call_read_back is not None and handle.sql == Q.CALL_EXPLAIN_SQL:
+            return self.call_read_back
         value = handle.options.get(attr)
         if value is None and self.inherit_connection_timeout:
             value = handle.conn.default_timeout
@@ -145,9 +157,15 @@ class FakeIbmDb:
     # -- statements ------------------------------------------------------------------------
     def prepare(self, conn, sql, options=None):
         self.calls.append(("prepare", sql, dict(options or {})))
-        if Q.MARKED_PK_LOOKUP_RE.match(sql):
-            hexid = "%064X" % (len(self.state.cache) + 1)
-            self.state.cache.append([hexid, 6.8, 0, sql])
+        if Q.is_allowed_marked(sql):
+            n = len(self.state.cache) + 1
+            cost = 38_149_348.0 if "CROSS JOIN" in sql else 6.8
+            # [hexid, cost, executions, text, package schema, name, version, section number]
+            # Db2 12.1.5 reports all four package fields as NULL for dynamic SQL (G2.4 live run).
+            hexid = "%064X" % n
+            self.state.sections[hexid] = 10 * n
+            meta = DYNAMIC_PACKAGE + (10 * n,) if self.package_metadata else (None, None, None, None)
+            self.state.cache.append([hexid, cost, 0, sql, *meta])
         return FakeStmt(conn, sql, options)
 
     def free_stmt(self, stmt):
@@ -167,7 +185,7 @@ class FakeIbmDb:
 
     def execute(self, stmt, params=None):
         self.calls.append(("execute", stmt.sql, tuple(params or ())))
-        if stmt.sql in Q.PREPARE_ONLY_SQL or Q.MARKED_PK_LOOKUP_RE.match(stmt.sql):
+        if stmt.sql in Q.PREPARE_ONLY_SQL or Q.is_allowed_marked(stmt.sql):
             raise AssertionError("the fake must never be asked to execute a prepare-only statement")
         if stmt.sql == Q.CALL_EXPLAIN_SQL:
             if self.prepared_call_error:
@@ -192,9 +210,12 @@ class FakeIbmDb:
         hexid = executable_id.hex().upper()
         entry = next(e for e in self.state.cache if e[0] == hexid)
         self.state.clock += 1
+        # EXPLAIN writes the CLI package identity and the real section, whatever the cache reports.
+        schema, name, version = DYNAMIC_PACKAGE if entry[4] is None else entry[4:7]
         inst = {"requester": "DB2INST1", "time": "2026-11-07-10.00.00.%06d" % self.state.clock,
-                "source_name": "SYSSH200", "source_schema": "NULLID", "source_version": "",
-                "text": entry[3], "cost": cost if cost is not None else 6.9}
+                "source_name": name, "source_schema": schema, "source_version": version,
+                "sectno": self.state.sections.get(hexid, entry[7]), "text": entry[3],
+                "cost": cost if cost is not None else 6.9}
         self.state.pending.append(inst)
         return inst
 
@@ -227,18 +248,39 @@ class FakeIbmDb:
             return [tuple(e) for e in self.state.cache if rx.match(e[3])]
         if sql == A["EXPLAIN_LOCATE (by marker)"]:
             rx = like_to_regex(params[0])
-            return [(i["requester"], i["time"], i["source_name"], i["source_schema"], i["source_version"], 1, 1)
-                    for i in insts if rx.match(i["text"])]
+            return [(i["requester"], i["time"], i["source_name"], i["source_schema"], i["source_version"], 1,
+                     i["sectno"], i["text"]) for i in insts if rx.match(i["text"])]
+        P = Q.IT3_SELECTS
+        if sql == P["preflight STMT_CONC"]:
+            return [("OFF",)]
+        if sql == P["preflight EXPLAIN tables"]:
+            return [(t,) for t in Q.EXPLAIN_TABLE_NAMES] + [("APP_SETTING",)]
+        if sql == P["preflight LIMITS"]:
+            return [("query.max_rows", "500", "INTEGER"), ("query.max_estimated_cost", self.limit_cost, "DECIMAL"),
+                    ("query.timeout_seconds", str(self.limit_timeout), "INTEGER")]
+        if sql == P["preflight SOURCES"]:
+            return [("DB2INTEL_DEMO",)]
+        if sql == P["preflight UDF shadowing"]:
+            return []
+        if sql == P["SYSCAT.INDEXES (index owner)"]:
+            return [("DB2INTEL_DEMO", "CUSTOMER")] if params == ("SYSIBM", "SQL261106") else []
+        if sql == P["LEFTOVER EXPLAIN_OBJECT (by key)"]:
+            return [(2 * len(self._by_key(params)),)]
+        if sql == P["LEFTOVER EXPLAIN_OPERATOR (by key)"]:
+            return [(2 * len(self._by_key(params)),)]
         if sql == A["LEFTOVER EXPLAIN_STATEMENT (by marker)"]:
             rx = like_to_regex(params[0])
             return [(2 * sum(1 for i in insts if rx.match(i["text"])),)]
         if sql == A["EXPLAIN_INSTANCE count (by key)"]:
             return [(len(self._by_key(params)),)]
         if sql == A["EXPLAIN_STATEMENT (by key)"]:
-            return [(lvl, 1, 1, i["cost"], i["text"]) for i in self._by_key(params) for lvl in ("O", "S")]
+            return [(lvl, 1, i["sectno"], i["cost"], i["text"]) for i in self._by_key(params) for lvl in ("O", "S")]
         if sql == A["EXPLAIN_OBJECT (by key)"]:
-            return [("DB2INTEL_DEMO", "CUSTOMER", "TA", "O", 1, 1) for _ in self._by_key(params)]
+            return [row for i in self._by_key(params)
+                    for row in (("DB2INTEL_DEMO", "CUSTOMER", "TA", "O", 1, i["sectno"]),
+                                ("SYSIBM", "SQL261106", "IX", "O", 1, i["sectno"]))]
         if sql == A["EXPLAIN_OPERATOR (by key)"]:
             return [row for i in self._by_key(params)
-                    for row in ((1, "RETURN", i["cost"], "O", 1, 1), (2, "FETCH", i["cost"], "O", 1, 1))]
+                    for row in ((1, "RETURN", i["cost"], "O", 1, i["sectno"]),
+                                (2, "FETCH", i["cost"], "O", 1, i["sectno"]))]
         raise AssertionError(f"the fake has no answer for: {sql}")

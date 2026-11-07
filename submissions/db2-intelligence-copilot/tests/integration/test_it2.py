@@ -2,7 +2,8 @@
 
 One marked PK lookup is prepared (never executed) and found in the package cache by its marker.
 Its section is then explained three ways, all in one unit of work that is rolled back:
-  path 1  production code: Db2AnalysisSession.explain_from_section (ibm_db.callproc, no timeout)
+  path 1  the G2.3 production code: Db2AnalysisSession.explain_from_section (ibm_db.callproc, no
+          timeout); since G2.4 analyze() uses path 2 through Db2AnalysisSession.explain_section
   path 2  fix A: a prepared CALL with a statement timeout that must read back before execution.
           ibm_db 3.3.0 returns OUT values only from callproc (ibm_db.c, ibm_db_callproc); execute()
           returns True, so this path's instance is located through the marker alone.
@@ -61,7 +62,7 @@ def test_it2_explain_from_section_paths():
             hexid = str(cache[0][0]).strip().upper()
             inputs = (bytes.fromhex(hexid), "M", None, -1, Q.EXPLAIN_SCHEMA)
 
-            # path 1: production callproc
+            # path 1: callproc (the G2.3 production path)
             k1 = session.explain_from_section(hexid, Q.EXPLAIN_SCHEMA)
             facts["path1_out_time"] = k1.time
 
@@ -95,11 +96,16 @@ def test_it2_explain_from_section_paths():
             facts["row_counts"] = {k: [len(c[k]) for c in content.values()] for k in ("statement", "object", "operator")}
             path1 = A._timestamp_digits(k1.time)
             path3 = A._timestamp_digits(facts["path3_out_time"])
-            facts["path1_located"] = path1 in by_time
-            facts["path3_located"] = path3 in by_time
+            # ibm_db may return no EXPLAIN_TIME from callproc. Production locates those rows
+            # through the unique marker; if a timestamp is returned, it must identify one of
+            # the marker-tagged instances.
+            facts["path1_timestamp_returned"] = path1 is not None
+            facts["path3_timestamp_returned"] = path3 is not None
+            facts["path1_matches_marker"] = path1 is None or path1 in by_time
+            facts["path3_matches_marker"] = path3 is None or path3 in by_time
             facts["all_instances_identical"] = len({repr(c) for c in content.values()}) == 1
             assert facts["instance_counts"] == [1, 1, 1]
-            assert facts["path1_located"] and facts["path3_located"]
+            assert facts["path1_matches_marker"] and facts["path3_matches_marker"]
             assert facts["all_instances_identical"], "the three paths produced different explain rows"
             assert facts["path2_timeout_read_back"] == run.timeout
         finally:

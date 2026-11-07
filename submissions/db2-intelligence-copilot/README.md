@@ -191,7 +191,7 @@ cp .env.example .env
 |---|---|
 | `DB2_HOST`, `DB2_PORT`, `DB2_DATABASE`, `DB2_USER`, `DB2_PASSWORD`, `DB2_SECURITY` | Db2 connection (password only in `.env`) |
 | `DB2INTEL_MIGRATION_DATABASES`, `DB2INTEL_MIGRATION_HOSTS` | Where migrations and guard checks may connect (local `TESTDB` by default) |
-| `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `EMBEDDING_DIM`, `OLLAMA_BASE_URL` | Embeddings (`ollama` or `deterministic`); dimension must be 768 |
+| `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `EMBEDDING_DIM`, `EMBEDDING_TIMEOUT_SECONDS`, `OLLAMA_BASE_URL` | Embeddings (`ollama` or `deterministic`); dimension must be 768 |
 | `LLM_PROVIDER`, `LLM_MODEL`, `LLM_BASE_URL`, `LLM_TIMEOUT_SECONDS` | SQL generation (`none` or `ollama`); the model server must be local unless `DB2INTEL_LLM_ALLOW_REMOTE=true` |
 | `DB2INTEL_API_HOST`, `APP_PORT`, `DB2INTEL_API_TOKEN` | API bind address (loopback only) and bearer token (16+ characters). Without a token the API runs, but the guard pool is not started and `/api/v1/guard/check` answers 503 `guard_disabled` |
 | `DB2INTEL_WORKER_LOG` | Redacted, size-bounded guard worker stderr log (default `logs/guard-worker.log`, git-ignored; must end in `.log`; `off` discards it) |
@@ -297,22 +297,39 @@ uv pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-`tests/integration/` is reserved for tests against a real Db2 database. They must carry the `db2`
-marker and are skipped unless `DB2INTEL_IT=1`; none is approved yet, so the only test there is a
-placeholder that always skips.
+`tests/integration/` contains guarded real-Db2 checks. They carry the `db2` marker and run only
+through `python -m integration.supervisor` with a fresh evidence directory outside the repository.
+G2.1–G2.4 were run on localhost TESTDB on 2026-11-07; each integration test has a before-snapshot,
+baseline gate, hard deadline and after-snapshot.
 
-1,300 offline tests cover the parser, analysis and cleanup logic (with fake Db2 responses), the
+The full offline suite has **1,603 passed, 4 skipped** (the skips are the four integration tests,
+which run only under the supervisor); the separate Phase 2B probe set has **158 passed**. Tests
+cover the parser, analysis and cleanup logic (with fake Db2 responses, including Db2's all-NULL
+package metadata for dynamic SQL), the
 migration runner, the API, the worker pool (real subprocesses with fake backends: deadlines,
 SIGKILL of the whole process group, bounded pool, degraded latch, environment allow-list,
 redacted stderr log, explain-tables-empty startup check, shutdown on SIGTERM), the NL-to-SQL pipeline, schema
 cards and a security suite (no route can reach execution, AI-generated SQL is never prepared, a
-corpus of 64 hostile statements never reaches the database). Mutation testing (deliberately
-breaking one safety check at a time) confirmed that the tests catch every mutation tried.
+corpus of 64 hostile statements never reaches the database).
 
-**Real Db2 verification (controlled probe, 2026-11-07, TESTDB):** a supervised probe ran only the
-guard's internal read-only SQL plus prepare/EXPLAIN of five test queries, with snapshots before and
-after proving the explain tables were empty again, `QUERY_AUDIT` unchanged, the migration ledger
-unchanged and the protected `DB2INST1` tables unchanged.
+Mutation testing (one safety check broken at a time; the tests must fail), all run against the
+current code: G2.4 bounded EXPLAIN and dynamic-SQL metadata 49/50, Guard 38/38, Phase 2C 55/55,
+G1.2 48/48, Shutdown 16/16, G2.0 integration tooling 58/60. The three survivors change no checked
+behaviour:
+- G2.4: removing IT3's extra rollback before its final whole-table counts; every `analyze()` call
+  has already rolled back and verified its own cleanup.
+- G2.0: adding the snapshot dictionary to the printed snapshot summary; a snapshot holds only
+  counts, the migration ledger and fingerprints, never row data.
+- G2.0: removing IT2's separate marker-leftover assertion; IT2 also asserts that the whole
+  `EXPLAIN_STATEMENT` table (with the other 10 explain tables) is empty, which covers it.
+
+**Real Db2 verification (G2.1–G2.4, 2026-11-07, TESTDB):** the production guard's prepared
+`EXPLAIN_FROM_SECTION` call used the configured 30-second statement timeout and read it back before
+execution. Five fixed cases were checked: three approved with plans, one rejected by the 50,000
+timeron cost limit before EXPLAIN, and one blocked statically for the protected schema. No user SQL
+was executed, and `callproc` was not used by the production path. After rollback, all 11 EXPLAIN
+tables and `QUERY_AUDIT` were empty; the migration ledger and protected `DB2INST1` table fingerprints
+matched their before-snapshots.
 
 | Test query | Guard decision | Estimated cost (timerons) |
 |---|---|---:|
@@ -337,8 +354,9 @@ unchanged and the protected `DB2INST1` tables unchanged.
     demo schema only, plus audit persistence; neither exists yet. Until then the guard connects as
     the instance owner, so the guard's checks are the only barrier, which is why execution is off.
   - AI-generated SQL is only statically checked; Db2 prepare/EXPLAIN of AI SQL is not yet enabled.
-  - The `EXPLAIN_FROM_SECTION` call has no Db2-side timeout that the driver can confirm (`ibm_db`
-    cannot read a connection-level timeout back); it is bounded by the worker deadline instead.
+  - The production guard uses a prepared `EXPLAIN_FROM_SECTION` call with a statement timeout that
+    is read back before execution. Db2 cancellation of a deliberately slow EXPLAIN and the complete
+    worker-process path against live Db2 have not yet been tested.
   - The degraded state is held in memory and cleared by a restart. A new worker then refuses to
     start if any explain table still holds rows, but that check has so far been tested only with
     fakes.
@@ -347,9 +365,10 @@ unchanged and the protected `DB2INST1` tables unchanged.
   - Ollama integration and the HTTP server have not yet been run end to end; Db2 `VECTOR` search
     is not implemented yet.
   - Single Db2 data source (`DB2INTEL_DEMO` in `TESTDB`); `SAMPLE` is registered but disabled.
-- **Next Steps:** Db2-side timeout for EXPLAIN, restricted execution user and audit persistence,
-  schema embeddings in `DB2INTEL.SCHEMA_EMBEDDING` with `VECTOR_DISTANCE` search, verified-query
-  reuse, Db2 integration tests, a web UI, and watsonx.ai as an LLM provider.
+- **Next Steps:** test cancellation of a deliberately slow EXPLAIN and the live worker-process path,
+  add a restricted execution user and audit persistence, implement schema embeddings in
+  `DB2INTEL.SCHEMA_EMBEDDING` with `VECTOR_DISTANCE` search, add verified-query reuse, build a web UI,
+  and add watsonx.ai as an LLM provider.
 
 ---
 

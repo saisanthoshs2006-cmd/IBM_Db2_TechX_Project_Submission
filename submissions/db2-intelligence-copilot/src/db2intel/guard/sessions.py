@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 from db2intel.db.connection import Db2Connection, DbError
-from db2intel.guard.analysis import _HEX_ID_RE, ExplainKey
+from db2intel.guard.analysis import _HEX_ID_RE, EXPLAIN_CALL_SQL, ExplainKey, ExplainTimeoutUnconfirmed
 from db2intel.guard.execution import QueryResult
 
 _DEFERRED_PREPARE_OFF = 0
@@ -21,6 +21,11 @@ CURRENT_PATH_SQL = "SELECT CURRENT PATH FROM SYSIBM.SYSDUMMY1"
 SYSTEM_PATH_SCHEMAS = frozenset({"SYSIBM", "SYSFUN", "SYSPROC", "SYSIBMADM"})
 # Initial values size the OUT buffers; the timestamp placeholder matches the 2026-11-06 trial.
 _EXPLAIN_OUT_PLACEHOLDERS = ("", "2000-01-01-00.00.00.000000", "", "", "")
+_MAX_EXPLAIN_TIMEOUT = 300  # the range of query.timeout_seconds (guard.context.LIMIT_RANGES)
+
+
+def _confirmed_timeout(value, expected: int) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value == expected
 
 
 def _driver_error(db, exc: Exception, what: str) -> DbError:
@@ -86,7 +91,58 @@ class Db2AnalysisSession:
             raise DbError(f"CURRENT PATH is not the system path: {rows[0][0]!r}")
         return schemas
 
+    def explain_section(self, executable_id_hex: str, explain_schema: str, timeout_seconds: int) -> None:
+        """EXPLAIN_FROM_SECTION as a prepared CALL bounded by a Db2 query timeout.
+
+        The timeout is set when the CALL is prepared and must read back from the statement
+        handle before anything runs; otherwise ExplainTimeoutUnconfirmed is raised and the CALL
+        is never executed. Parameters 1-4 are inputs, 5 (explain schema) INOUT, 6-10 OUT. ibm_db
+        3.3.0 returns no OUT values from execute(), so the caller locates the rows by marker.
+        A timeout surfaces as DbError with SQLSTATE 57014. (Verified on Db2 12.1.5 in G2.3.)
+        """
+        hexid = executable_id_hex.strip().upper()
+        if not _HEX_ID_RE.match(hexid):
+            raise DbError("invalid executable id")
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) \
+                or not 1 <= timeout_seconds <= _MAX_EXPLAIN_TIMEOUT:
+            raise ExplainTimeoutUnconfirmed(f"invalid explain timeout {timeout_seconds!r}")
+        db = self._db
+        attr = getattr(db, "SQL_ATTR_QUERY_TIMEOUT", None)
+        if attr is None:
+            raise ExplainTimeoutUnconfirmed("the Db2 driver does not support statement timeouts")
+        stmt = None
+        try:
+            try:
+                stmt = db.prepare(self._handle, EXPLAIN_CALL_SQL, {attr: timeout_seconds})
+                if not stmt:
+                    raise RuntimeError("prepare returned no statement")
+                confirmed = db.get_option(stmt, attr, _STATEMENT_OPTION)
+            except Exception as exc:
+                raise _driver_error(db, exc, "could not prepare EXPLAIN_FROM_SECTION") from None
+            if not _confirmed_timeout(confirmed, timeout_seconds):
+                raise ExplainTimeoutUnconfirmed(
+                    f"the query timeout reads back {confirmed!r}, expected {timeout_seconds}")
+            inputs = (bytes.fromhex(hexid), "M", None, -1, explain_schema)
+            types = (db.SQL_PARAM_INPUT,) * 4 + (db.SQL_PARAM_INPUT_OUTPUT,)
+            try:
+                for n, (value, ptype) in enumerate(zip(inputs, types), 1):
+                    db.bind_param(stmt, n, value, ptype)
+                for n, value in enumerate(_EXPLAIN_OUT_PLACEHOLDERS, 6):
+                    db.bind_param(stmt, n, value, db.SQL_PARAM_OUTPUT)
+                if db.execute(stmt) is False:
+                    raise RuntimeError("execute returned False")
+            except Exception as exc:
+                raise _driver_error(db, exc, "EXPLAIN_FROM_SECTION failed") from None
+        finally:
+            if stmt:
+                try:
+                    db.free_stmt(stmt)
+                except Exception:
+                    pass
+
     def explain_from_section(self, executable_id_hex: str, explain_schema: str) -> ExplainKey:
+        """The callproc form, with no Db2-side timeout. Not used by analyze() since G2.4; kept
+        so the G2 integration test (IT2) can compare it with the prepared CALL."""
         hexid = executable_id_hex.strip().upper()
         if not _HEX_ID_RE.match(hexid):
             raise DbError("invalid executable id")

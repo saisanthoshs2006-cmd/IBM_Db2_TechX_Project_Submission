@@ -57,6 +57,95 @@ def test_statements_are_freed_even_if_rollback_fails():
     assert drv.calls[-1] == ("free_stmt", "stmt1")
 
 
+# ---- bounded EXPLAIN: prepared CALL with a confirmed statement timeout (production since G2.4) ----
+def explain(drv, hexid=HEXID, timeout=30):
+    return Db2AnalysisSession(StubConnection(drv)).explain_section(hexid, "DB2INTEL", timeout)
+
+
+def test_explain_section_prepares_the_call_with_the_timeout_and_reads_it_back_first():
+    drv = StubDriver()
+    assert explain(drv, HEXID.lower()) is None
+    kinds = [c[0] for c in drv.calls]
+    assert kinds == ["prepare", "get_option"] + ["bind_param"] * 10 + ["execute", "free_stmt"]
+    assert drv.calls[0] == ("prepare", A.EXPLAIN_CALL_SQL, {StubDriver.SQL_ATTR_QUERY_TIMEOUT: 30})
+    assert drv.calls[1] == ("get_option", "stmt1", StubDriver.SQL_ATTR_QUERY_TIMEOUT, 0)
+    binds = [c[2:] for c in drv.calls if c[0] == "bind_param"]
+    assert binds[:5] == [(1, bytes.fromhex(HEXID), 1), (2, "M", 1), (3, None, 1), (4, -1, 1), (5, "DB2INTEL", 2)]
+    assert [b[0] for b in binds[5:]] == [6, 7, 8, 9, 10] and all(b[2] == 4 for b in binds[5:])
+    assert not any(c[0] == "callproc" for c in drv.calls)
+
+
+def test_explain_call_sql_is_the_only_call_and_matches_the_procedure_signature():
+    assert A.EXPLAIN_CALL_SQL == "CALL SYSPROC.EXPLAIN_FROM_SECTION(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+
+
+@pytest.mark.parametrize("readback", [False, None, 0, 29, 31, True, "30", 30.0])
+def test_unconfirmed_timeout_is_refused_and_the_call_never_runs(readback):
+    drv = StubDriver(timeout_readback=readback)
+    with pytest.raises(A.ExplainTimeoutUnconfirmed):
+        explain(drv)
+    kinds = [c[0] for c in drv.calls]
+    assert kinds == ["prepare", "get_option", "free_stmt"]
+
+
+def test_boolean_read_back_never_confirms_a_one_second_timeout():
+    """True == 1 in Python; a boolean read-back is not a timeout, whatever the requested value."""
+    drv = StubDriver(timeout_readback=True)
+    with pytest.raises(A.ExplainTimeoutUnconfirmed):
+        explain(drv, timeout=1)
+    assert [c[0] for c in drv.calls] == ["prepare", "get_option", "free_stmt"]
+    assert explain(StubDriver(timeout_readback=1), timeout=1) is None
+
+
+@pytest.mark.parametrize("timeout", [0, 301, -1, True, "30", 30.0, None])
+def test_invalid_timeout_never_reaches_the_driver(timeout):
+    drv = StubDriver()
+    with pytest.raises(A.ExplainTimeoutUnconfirmed):
+        explain(drv, timeout=timeout)
+    assert drv.calls == []
+
+
+def test_driver_without_query_timeout_is_refused():
+    class NoTimeout(StubDriver):
+        def __getattribute__(self, name):
+            if name == "SQL_ATTR_QUERY_TIMEOUT":
+                raise AttributeError(name)
+            return super().__getattribute__(name)
+    drv = NoTimeout()
+    with pytest.raises(A.ExplainTimeoutUnconfirmed):
+        explain(drv)
+    assert drv.calls == []
+
+
+@pytest.mark.parametrize("hexid", ["", "XYZ", "ABC", "'; DROP TABLE X --"])
+def test_invalid_executable_id_never_reaches_the_driver_on_the_bounded_path(hexid):
+    drv = StubDriver()
+    with pytest.raises(DbError):
+        explain(drv, hexid=hexid)
+    assert drv.calls == []
+
+
+@pytest.mark.parametrize("step", ["prepare", "get_option", "bind_param", "execute"])
+def test_driver_failure_at_any_step_is_a_dberror_and_the_statement_is_freed(step):
+    drv = StubDriver(fail={step: "[IBM][CLI Driver] SQL0952N cancelled  SQLSTATE=57014"})
+    with pytest.raises(DbError) as info:
+        explain(drv)
+    assert info.value.sqlstate == "57014" and not isinstance(info.value, A.ExplainTimeoutUnconfirmed)
+    if step != "prepare":
+        assert drv.calls[-1] == ("free_stmt", "stmt1")
+
+
+def test_execute_returning_false_is_an_error():
+    class FalseExecute(StubDriver):
+        def execute(self, stmt, params=None):
+            self.calls.append(("execute", stmt))
+            return False
+    drv = FalseExecute()
+    with pytest.raises(DbError):
+        explain(drv)
+    assert drv.calls[-1] == ("free_stmt", "stmt1")
+
+
 def test_explain_from_section_binds_executable_id_and_reads_out_keys():
     out = ("stmt", bytes.fromhex(HEXID), "M", None, -1, "DB2INTEL  ", "DB2INST1", "2026-11-06-15.30.00.000000",
            "SYSSH200", "NULLID", "")
