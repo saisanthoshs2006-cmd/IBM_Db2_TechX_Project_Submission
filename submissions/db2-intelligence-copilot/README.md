@@ -373,9 +373,11 @@ matched their before-snapshots.
 ---
 
 ## Team Members & Credits
+Team **CYBORG**, a single-member team.
+
 | Name | GitHub Handle | Role / Contribution |
 |---|---|---|
-| Full Name | [@saisanthoshs2006-cmd](https://github.com/saisanthoshs2006-cmd) | Backend, Db2 integration, SQL guard and AI workflow |
+| Sai Santhosh S | [@saisanthoshs2006-cmd](https://github.com/saisanthoshs2006-cmd) | Sole developer: backend, Db2 integration, SQL guard and AI workflow |
 
 Credits: Db2 explain table DDL adapted from IBM's `EXPLAIN.DDL` (Db2 12.1.5); the `ibm_db` driver
 by IBM.

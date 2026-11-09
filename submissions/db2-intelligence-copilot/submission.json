@@ -10,13 +10,13 @@
     "repo_url": ""
   },
   "team": {
-    "name": "Team Name Here",
+    "name": "CYBORG",
     "members": [
       {
-        "name": "Full Name",
+        "name": "Sai Santhosh S",
         "github": "saisanthoshs2006-cmd",
-        "email": "user@example.com",
-        "role": "Backend, Db2 integration, SQL guard and AI workflow"
+        "email": "saisanthoshs2006@gmail.com",
+        "role": "Sole developer: backend, Db2 integration, SQL guard and AI workflow"
       }
     ]
   },
